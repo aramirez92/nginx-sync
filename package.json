@@ -1,0 +1,28 @@
+{
+  "name": "nginx-sync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Downloads an nginx config from a remote endpoint into ./sites-enabled",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aramirez92/nginx-sync.git"
+  },
+  "homepage": "https://github.com/aramirez92/nginx-sync#readme",
+  "module": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "sync": "bun run src/sync.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.0",
+    "typescript": "^5.7.0"
+  }
+}

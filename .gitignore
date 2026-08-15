@@ -1,0 +1,21 @@
+# deps
+node_modules/
+
+# env — nunca commitear secretos
+.env
+.env.*
+!.env.example
+
+# config descargada: el directorio se versiona, el contenido no
+sites-enabled/*
+!sites-enabled/.gitkeep
+
+# escrituras atómicas a medias
+*.tmp
+
+# backups de link.sh
+*.bak.*
+
+# varios
+*.log
+.DS_Store
