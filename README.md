@@ -17,7 +17,7 @@ Corre con [Bun](https://bun.sh) y TypeScript. Sin paso de build.
 ## Requisitos
 
 - [Bun](https://bun.sh) >= 1.2
-- nginx y systemd (en el servidor Linux; `link.sh` e `install.sh` los necesitan)
+- nginx y systemd (en el servidor Linux; los necesita `install.sh`)
 
 ## Instalación
 
@@ -93,33 +93,6 @@ Códigos de error de `POST /sync`:
 | `503` | `SYNC_TOKEN` sin configurar: la ruta está deshabilitada por diseño. |
 | `502` | El endpoint remoto falló, respondió vacío, o no se pudo escribir el archivo. |
 
-### Enlazar nginx
-
-```bash
-sudo ./link.sh
-```
-
-Deja `/etc/nginx/sites-enabled` → `<ruta-del-proyecto>/sites-enabled`, valida con
-`nginx -t` y recarga el servicio.
-
-> **Advertencia:** `link.sh` reemplaza `/etc/nginx/sites-enabled` en el sistema y
-> corre como root. Antes de mover nada hace un backup con timestamp
-> (`/etc/nginx/sites-enabled.bak.AAAAMMDDHHMMSS`) y, si `nginx -t` falla, borra el
-> symlink y restaura el backup automáticamente. Aun así conviene probarlo primero
-> en una máquina de pruebas.
-
-Ensayo en seco, sin tocar el path real ni recargar nginx:
-
-```bash
-NGINX_SITES_ENABLED=/tmp/fake-sites-enabled sudo -E ./link.sh
-```
-
-El script es idempotente: si el symlink ya apunta al destino correcto, sale sin
-hacer nada.
-
-> `link.sh` es para el servidor **Linux**. En macOS no existen
-> `/etc/nginx/sites-enabled` ni `systemctl`.
-
 ## Recarga automática de nginx
 
 Con `NGINX_RELOAD=true`, cada vez que la config descargada **cambia** (y sólo
@@ -134,9 +107,9 @@ el error queda en el log y en `reloadError`. El archivo descargado ya está en
 disco, así que se puede corregir y reintentar con `POST /sync`.
 
 Para que el servicio pueda correr esos dos comandos sin contraseña hace falta una
-regla de sudoers. **`sudo ./install.sh --with-reload` la crea sola**, resolviendo
-las rutas reales y validándola con `visudo -cf`. A mano sería así — siempre con
-`visudo`, que valida la sintaxis antes de guardar:
+regla de sudoers. **`install.sh` la crea sola**, resolviendo las rutas reales y
+validándola con `visudo -cf` (`--no-reload` la omite). A mano sería así — siempre
+con `visudo`, que valida la sintaxis antes de guardar:
 
 ```bash
 sudo visudo -f /etc/sudoers.d/nginx-sync
@@ -221,8 +194,7 @@ nginx-sync/
 ├── sites-enabled/                # destino de la descarga (contenido no versionado)
 ├── deploy/
 │   └── nginx-sync.service        # plantilla de la unidad de systemd
-├── install.sh                    # instala el servicio (root)
-├── link.sh                       # symlink de /etc/nginx/sites-enabled (root)
+├── install.sh                    # instalación completa: symlink, sudoers, servicio (root)
 ├── .env.example
 ├── tsconfig.json
 └── package.json
@@ -242,8 +214,7 @@ cambiar una línea ahí. Los tests inyectan fakes en memoria por eso mismo.
 | `bun run sync` | Sincronización única y salida. |
 | `bun test` | Tests unitarios. |
 | `bun run typecheck` | `tsc --noEmit`. |
-| `sudo ./link.sh` | Enlaza `/etc/nginx/sites-enabled` al proyecto. |
-| `sudo ./install.sh` | Instala y arranca el servicio de systemd. |
+| `sudo ./install.sh` | Instala todo y arranca el servicio de systemd. |
 
 ---
 
@@ -266,52 +237,51 @@ cualquier usuario.
 > atravesarlo y systemd falla con `203/EXEC`. Un symlink no cambia los permisos del
 > directorio destino.
 
-### 2. Código y configuración
+### 2. Clonar y configurar
 
 ```bash
 sudo git clone https://github.com/aramirez92/nginx-sync.git /opt/nginx-sync
 cd /opt/nginx-sync
-sudo bun install
 sudo cp .env.example .env
-sudo $EDITOR .env          # ENDPOINT_URL, SYNC_TOKEN, NGINX_RELOAD=true
+sudo $EDITOR .env          # ENDPOINT_URL y SYNC_TOKEN
 ```
 
 Generar un token: `openssl rand -hex 32`.
 
-### 3. Enlazar nginx
+### 3. Instalar
 
 ```bash
-sudo ./link.sh             # /etc/nginx/sites-enabled -> /opt/nginx-sync/sites-enabled
+sudo ./install.sh --dry-run    # ver qué haría, sin tocar nada
+sudo ./install.sh              # instalar de verdad
 ```
 
-### 4. Instalar el servicio
-
-```bash
-sudo ./install.sh --dry-run        # ver qué haría, sin tocar nada
-sudo ./install.sh --with-reload    # instalar de verdad
-```
-
-`install.sh` hace todo lo demás:
+Un solo comando hace todo:
 
 | Paso | Qué hace |
 |---|---|
 | Resuelve `bun` | Busca el binario real. Si cuelga de un home inaccesible, lo copia a `/usr/local/bin/bun` — el arreglo del `203/EXEC`. |
 | Usuario | Crea `nginx-sync` (`--system`, sin home, sin shell) si no existe. |
+| Configuración | Copia `.env` del ejemplo si falta y corre `bun install` si falta `node_modules/`. Aborta si `ENDPOINT_URL` sigue sin completar. |
 | Permisos | `chown -R` del proyecto, `.env` a `600`. |
 | Verifica | `sudo -u nginx-sync bun --version` **antes** de instalar; si falla, aborta con el motivo. |
-| Unidad | Genera `/etc/systemd/system/nginx-sync.service` desde `deploy/nginx-sync.service`. |
-| Sudoers | Sólo con `--with-reload`: los dos comandos exactos, validados con `visudo -cf`. |
-| Arranca | `daemon-reload`, `enable --now`, y muestra el estado y el journal. |
+| Sudoers | Los dos comandos exactos para recargar nginx, validados con `visudo -cf`. |
+| Symlink | `/etc/nginx/sites-enabled` → el proyecto, con backup con timestamp del anterior y rollback si `nginx -t` falla. |
+| Servicio | Genera la unidad desde `deploy/nginx-sync.service`, `daemon-reload`, `enable --now`, y muestra estado y journal. |
 
-Opciones: `--user OTRO` (otro usuario de servicio), `--dry-run`, `--help`.
+Opciones: `--dry-run`, `--no-reload` (sin sudoers), `--help`.
 
-> **Advertencia:** `install.sh` corre como root: escribe en `/etc/systemd/system/`,
-> crea un usuario del sistema, hace `chown -R` del directorio del proyecto y —sólo
-> con `--with-reload`— agrega `/etc/sudoers.d/nginx-sync`. Esa regla lista los dos
-> comandos exactos, nunca `NOPASSWD: ALL`, y se valida con `visudo -cf` antes de
-> instalarse. Conviene correr primero `--dry-run`.
+> **Advertencia:** `install.sh` corre como root: reemplaza
+> `/etc/nginx/sites-enabled`, escribe en `/etc/systemd/system/` y
+> `/etc/sudoers.d/`, crea un usuario del sistema y hace `chown -R` del proyecto.
+> El symlink de nginx se hace con backup con timestamp
+> (`/etc/nginx/sites-enabled.bak.AAAAMMDDHHMMSS`) y se revierte solo si `nginx -t`
+> falla; la regla de sudoers lista los dos comandos exactos, nunca
+> `NOPASSWD: ALL`, y se valida antes de instalarse. Conviene correr primero
+> `--dry-run`.
 
-### 5. Verificar
+Es idempotente: se puede volver a correr después de un `git pull`.
+
+### 4. Verificar
 
 ```bash
 systemctl status nginx-sync                  # Active: active (running)
@@ -348,8 +318,15 @@ sudo systemctl restart nginx-sync
 | `status=200/CHDIR` | `WorkingDirectory` no existe o el usuario no puede entrar. | `sudo chown -R nginx-sync /opt/nginx-sync` |
 | `status=203/EXEC` con la ruta correcta | El binario perdió el bit de ejecución. | `sudo chmod 755 /usr/local/bin/bun` |
 | Arranca y muere: `[config] Falta la variable de entorno ENDPOINT_URL` | Falta `.env`, o el usuario no puede leerlo. | `sudo chown nginx-sync /opt/nginx-sync/.env` |
-| En el journal: `sudo: a password is required` | Falta la regla de sudoers, o las rutas no coinciden exactamente. | `sudo ./install.sh --with-reload`, y comparar con `which nginx`. |
+| En el journal: `sudo: a password is required` | Falta la regla de sudoers, o las rutas no coinciden exactamente. | `sudo ./install.sh`, y comparar con `which nginx`. |
 | `Permission denied` al escribir la config | El usuario no puede escribir en `sites-enabled/`. | `sudo chown -R nginx-sync /opt/nginx-sync/sites-enabled` |
+| `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
+
+Ensayar el symlink sin tocar `/etc/nginx`:
+
+```bash
+NGINX_SITES_ENABLED=/tmp/fake-sites-enabled sudo -E ./install.sh
+```
 
 Ver el detalle completo del fallo:
 
