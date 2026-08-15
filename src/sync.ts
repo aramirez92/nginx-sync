@@ -5,10 +5,10 @@ import { withRetry } from "./app/retry.ts";
 
 /**
  * Entrypoint CLI one-shot: `bun run sync`.
- * Reintenta ante fallos de red o del endpoint y sale 0/1 para cron, PM2 o systemd.
+ * Reintenta ante fallos de red o del endpoint y sale 0/1 para el que lo invoque.
  *
- * Sin top-level await a propósito: PM2 carga el script con `require()`, que no
- * soporta módulos async.
+ * Sin top-level await a propósito: así el módulo también se puede cargar con
+ * `require()`, que no soporta módulos async.
  */
 async function main(): Promise<number> {
   const logger = new ConsoleLogger("sync");
@@ -32,7 +32,7 @@ async function main(): Promise<number> {
   }
 }
 
-// exit() explícito: bajo PM2 el canal IPC mantiene vivo el event loop y el
-// proceso nunca terminaría solo. Es seguro porque ConsoleLogger escribe con
-// writeSync, así que no queda salida sin volcar.
+// exit() explícito: si el supervisor deja un canal IPC abierto, el event loop
+// sigue vivo y el proceso no terminaría solo. Es seguro porque ConsoleLogger
+// escribe con writeSync, así que no queda salida sin volcar.
 void main().then((code) => process.exit(code));

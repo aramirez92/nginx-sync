@@ -1,0 +1,32 @@
+# Plantilla de la unidad de systemd. install.sh reemplaza los marcadores de abajo
+# y escribe el resultado en /etc/systemd/system/nginx-sync.service.
+#
+# ExecStart usa la ruta absoluta del binario real de bun: systemd no lee el PATH
+# del login, y un symlink a un binario dentro de /root falla con 203/EXEC porque
+# el usuario del servicio no puede atravesar ese directorio.
+
+[Unit]
+Description=nginx-sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@BUN@ run @DIR@/src/index.ts
+Restart=on-failure
+RestartSec=5
+
+# Endurecimiento. El servicio sólo necesita escribir en sites-enabled/.
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=@DIR@/sites-enabled
+# NoNewPrivileges queda en 'no' a propósito: con 'yes', sudo no puede escalar y
+# el reload de nginx (NGINX_RELOAD=true) fallaría con "sudo: unable to ...".
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

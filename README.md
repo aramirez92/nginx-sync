@@ -7,17 +7,17 @@ que se sincronizó.
 
 Corre con [Bun](https://bun.sh) y TypeScript. Sin paso de build.
 
-- **CLI one-shot** (`bun run sync`) — ideal para cron.
 - **Servidor Express** (`bun run start`) — sincroniza al arrancar y expone
-  `POST /sync` para disparar la actualización bajo demanda.
+  `POST /sync` para disparar la actualización bajo demanda. Es lo que corre como
+  servicio de systemd.
+- **CLI one-shot** (`bun run sync`) — una sincronización manual y sale.
 
 ---
 
 ## Requisitos
 
 - [Bun](https://bun.sh) >= 1.2
-- nginx (sólo para `link.sh` y el reload, en el servidor Linux)
-- [PM2](https://pm2.keymetrics.io) (opcional, para el despliegue con PM2)
+- nginx y systemd (en el servidor Linux; `link.sh` e `install.sh` los necesitan)
 
 ## Instalación
 
@@ -52,20 +52,17 @@ Todas las variables van en `.env` (Bun lo carga solo, no hace falta `dotenv`).
 
 ## Uso
 
-### Sincronización única (cron)
+### Sincronización manual
 
 ```bash
 bun run sync
 ```
 
-Sale con código `0` si todo salió bien, `1` si la descarga o el reload fallaron.
-Ante un fallo reintenta cada `RETRY_DELAY_MS` hasta `CLI_RETRY_MAX_ATTEMPTS` veces.
+Descarga, escribe y sale. Código `0` si todo salió bien, `1` si la descarga o el
+reload fallaron. Ante un fallo reintenta cada `RETRY_DELAY_MS` hasta
+`CLI_RETRY_MAX_ATTEMPTS` veces.
 
-Se puede agendar con PM2 (ver más abajo) o con crontab:
-
-```cron
-*/5 * * * * cd /opt/nginx-sync && /home/USUARIO/.bun/bin/bun run sync >> /var/log/nginx-sync.log 2>&1
-```
+Con el servicio ya andando, lo normal es usar `POST /sync` en vez de esto.
 
 ### Servidor
 
@@ -136,8 +133,10 @@ Si `nginx -t` falla, **no** se recarga: nginx sigue con la configuración vieja 
 el error queda en el log y en `reloadError`. El archivo descargado ya está en
 disco, así que se puede corregir y reintentar con `POST /sync`.
 
-Para que el servicio pueda correr esos dos comandos sin contraseña, crear la
-regla de sudoers — siempre con `visudo`, que valida la sintaxis antes de guardar:
+Para que el servicio pueda correr esos dos comandos sin contraseña hace falta una
+regla de sudoers. **`sudo ./install.sh --with-reload` la crea sola**, resolviendo
+las rutas reales y validándola con `visudo -cf`. A mano sería así — siempre con
+`visudo`, que valida la sintaxis antes de guardar:
 
 ```bash
 sudo visudo -f /etc/sudoers.d/nginx-sync
@@ -220,14 +219,16 @@ nginx-sync/
 │   ├── index.ts                  # entrypoint del servidor
 │   └── sync.ts                   # entrypoint CLI one-shot
 ├── sites-enabled/                # destino de la descarga (contenido no versionado)
-├── ecosystem.config.cjs          # configuración de PM2
+├── deploy/
+│   └── nginx-sync.service        # plantilla de la unidad de systemd
+├── install.sh                    # instala el servicio (root)
 ├── link.sh                       # symlink de /etc/nginx/sites-enabled (root)
 ├── .env.example
 ├── tsconfig.json
 └── package.json
 ```
 
-`app/` y `domain/` no conocen `fetch`, ni el sistema de archivos, ni PM2:
+`app/` y `domain/` no conocen `fetch`, ni el sistema de archivos, ni systemd:
 sólo los contratos. `composition.ts` es el único lugar que instancia las clases
 concretas, así que cambiar el origen de la config o el servidor a recargar es
 cambiar una línea ahí. Los tests inyectan fakes en memoria por eso mismo.
@@ -241,239 +242,122 @@ cambiar una línea ahí. Los tests inyectan fakes en memoria por eso mismo.
 | `bun run sync` | Sincronización única y salida. |
 | `bun test` | Tests unitarios. |
 | `bun run typecheck` | `tsc --noEmit`. |
-| `bun run pm2:start` | Arranca las apps de `ecosystem.config.cjs`. |
-| `bun run pm2:logs` | Logs del webservice. |
-| `bun run pm2:status` | Estado de los procesos. |
-| `bun run pm2:restart` / `pm2:stop` / `pm2:delete` | Control de las apps. |
+| `sudo ./link.sh` | Enlaza `/etc/nginx/sites-enabled` al proyecto. |
+| `sudo ./install.sh` | Instala y arranca el servicio de systemd. |
 
 ---
 
 # Despliegue
 
-Dos opciones equivalentes: **PM2** (más simple de operar, logs y monitoreo
-incluidos) o **systemd** (sin dependencias extra). Elegir una, no las dos: si
-ambas corren el mismo servicio, van a competir por el puerto.
+Un servicio de systemd, instalado por `install.sh`. Probado en Debian/Ubuntu.
 
-Los pasos 1 a 4 son comunes.
-
-### 1. Instalar Bun
+### 1. Instalar Bun a nivel sistema
 
 ```bash
-curl -fsSL https://bun.sh/install | bash
-sudo ln -sf ~/.bun/bin/bun /usr/local/bin/bun    # ruta estable para PM2/systemd
-bun --version
+curl -fsSL https://bun.sh/install | sudo BUN_INSTALL=/usr/local bash
+/usr/local/bin/bun --version
 ```
 
-### 2. Usuario de servicio y código
+`BUN_INSTALL=/usr/local` deja el binario real en `/usr/local/bin/bun`, legible por
+cualquier usuario.
+
+> No sirve `ln -s ~/.bun/bin/bun /usr/local/bin/bun`: si se corrió como root, el
+> symlink apunta dentro de `/root`, que es `700`. El usuario del servicio no puede
+> atravesarlo y systemd falla con `203/EXEC`. Un symlink no cambia los permisos del
+> directorio destino.
+
+### 2. Código y configuración
 
 ```bash
-sudo useradd --system --home /opt/nginx-sync --shell /usr/sbin/nologin nginx-sync
 sudo git clone https://github.com/aramirez92/nginx-sync.git /opt/nginx-sync
-sudo chown -R nginx-sync:nginx-sync /opt/nginx-sync
 cd /opt/nginx-sync
-sudo -u nginx-sync bun install
-```
-
-### 3. Configurar `.env`
-
-```bash
-sudo -u nginx-sync cp .env.example .env
-sudo -u nginx-sync $EDITOR .env      # ENDPOINT_URL, SYNC_TOKEN, NGINX_RELOAD=true
-sudo chmod 600 .env
+sudo bun install
+sudo cp .env.example .env
+sudo $EDITOR .env          # ENDPOINT_URL, SYNC_TOKEN, NGINX_RELOAD=true
 ```
 
 Generar un token: `openssl rand -hex 32`.
 
-### 4. Enlazar nginx y habilitar el reload
+### 3. Enlazar nginx
 
 ```bash
-sudo ./link.sh                                    # /etc/nginx/sites-enabled -> ./sites-enabled
-sudo visudo -f /etc/sudoers.d/nginx-sync          # ver "Recarga automática de nginx"
-sudo -u nginx-sync bun run sync                   # primera descarga, de prueba
+sudo ./link.sh             # /etc/nginx/sites-enabled -> /opt/nginx-sync/sites-enabled
 ```
 
----
-
-## Opción A — PM2
-
-### A.1 Instalar PM2
+### 4. Instalar el servicio
 
 ```bash
-sudo npm install -g pm2      # o: bun install -g pm2
-pm2 --version
+sudo ./install.sh --dry-run        # ver qué haría, sin tocar nada
+sudo ./install.sh --with-reload    # instalar de verdad
 ```
 
-### A.2 Arrancar
+`install.sh` hace todo lo demás:
 
-```bash
-cd /opt/nginx-sync
-sudo -u nginx-sync pm2 start ecosystem.config.cjs
-sudo -u nginx-sync pm2 status
-```
-
-`ecosystem.config.cjs` define dos apps:
-
-| App | Qué hace |
+| Paso | Qué hace |
 |---|---|
-| `nginx-sync` | El webservice (`/health` y `/sync`). Se reinicia solo si se cae. |
-| `nginx-sync-cron` | Corre `bun run sync` cada 5 minutos y termina (`cron_restart`). |
+| Resuelve `bun` | Busca el binario real. Si cuelga de un home inaccesible, lo copia a `/usr/local/bin/bun` — el arreglo del `203/EXEC`. |
+| Usuario | Crea `nginx-sync` (`--system`, sin home, sin shell) si no existe. |
+| Permisos | `chown -R` del proyecto, `.env` a `600`. |
+| Verifica | `sudo -u nginx-sync bun --version` **antes** de instalar; si falla, aborta con el motivo. |
+| Unidad | Genera `/etc/systemd/system/nginx-sync.service` desde `deploy/nginx-sync.service`. |
+| Sudoers | Sólo con `--with-reload`: los dos comandos exactos, validados con `visudo -cf`. |
+| Arranca | `daemon-reload`, `enable --now`, y muestra el estado y el journal. |
 
-Para levantar sólo una: `pm2 start ecosystem.config.cjs --only nginx-sync`.
-Para cambiar la frecuencia, editar `cron_restart` en el ecosystem.
+Opciones: `--user OTRO` (otro usuario de servicio), `--dry-run`, `--help`.
 
-Si `bun` no está en el `PATH` del servicio, indicarlo explícitamente:
+> **Advertencia:** `install.sh` corre como root: escribe en `/etc/systemd/system/`,
+> crea un usuario del sistema, hace `chown -R` del directorio del proyecto y —sólo
+> con `--with-reload`— agrega `/etc/sudoers.d/nginx-sync`. Esa regla lista los dos
+> comandos exactos, nunca `NOPASSWD: ALL`, y se valida con `visudo -cf` antes de
+> instalarse. Conviene correr primero `--dry-run`.
 
-```bash
-BUN_PATH=/usr/local/bin/bun pm2 start ecosystem.config.cjs
-```
-
-### A.3 Arranque automático con el sistema
-
-```bash
-sudo -u nginx-sync pm2 save                 # guarda la lista de procesos actual
-sudo -u nginx-sync pm2 startup              # imprime un comando...
-# ...copiar y ejecutar el comando que imprimió (empieza con "sudo env PATH=...")
-```
-
-### A.4 Operación diaria
+### 5. Verificar
 
 ```bash
-pm2 status                       # estado de las dos apps
-pm2 logs nginx-sync              # logs en vivo
-pm2 logs nginx-sync --lines 100  # últimas 100 líneas
-pm2 monit                        # CPU y memoria en vivo
-pm2 restart nginx-sync           # reiniciar el webservice
-pm2 restart nginx-sync-cron      # forzar un sync ya mismo
+systemctl status nginx-sync                  # Active: active (running)
+curl -s localhost:3000/health | jq           # sync.state debe ser "ok"
+ls -l /etc/nginx/sites-enabled/              # el symlink al proyecto
+journalctl -u nginx-sync -f                  # logs en vivo
 ```
 
-Los logs también quedan en `logs/nginx-sync.out.log` y `logs/nginx-sync.err.log`.
-
-### A.5 Rotación de logs
-
-Sin esto los logs crecen sin límite:
+## Operación
 
 ```bash
-pm2 install pm2-logrotate
-pm2 set pm2-logrotate:max_size 10M
-pm2 set pm2-logrotate:retain 7
-```
-
-### A.6 Actualizar
-
-```bash
-cd /opt/nginx-sync
-sudo -u nginx-sync git pull
-sudo -u nginx-sync bun install
-sudo -u nginx-sync pm2 reload ecosystem.config.cjs
-```
-
----
-
-## Opción B — systemd
-
-### B.1 Crear la unidad
-
-```bash
-sudo $EDITOR /etc/systemd/system/nginx-sync.service
-```
-
-```ini
-[Unit]
-Description=nginx-sync
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=nginx-sync
-Group=nginx-sync
-WorkingDirectory=/opt/nginx-sync
-ExecStart=/usr/local/bin/bun run src/index.ts
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`ExecStart` necesita la ruta absoluta de `bun` (`which bun`); systemd no usa el
-`PATH` del login.
-
-### B.2 Habilitar y arrancar
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now nginx-sync
-sudo systemctl status nginx-sync
-```
-
-### B.3 Sincronización periódica
-
-Con un timer de systemd — `/etc/systemd/system/nginx-sync-cron.service`:
-
-```ini
-[Unit]
-Description=nginx-sync (sincronización única)
-
-[Service]
-Type=oneshot
-User=nginx-sync
-WorkingDirectory=/opt/nginx-sync
-ExecStart=/usr/local/bin/bun run src/sync.ts
-```
-
-`/etc/systemd/system/nginx-sync-cron.timer`:
-
-```ini
-[Unit]
-Description=Sincroniza la config de nginx cada 5 minutos
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-
-[Install]
-WantedBy=timers.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now nginx-sync-cron.timer
-systemctl list-timers nginx-sync-cron.timer
-```
-
-### B.4 Operación diaria
-
-```bash
-journalctl -u nginx-sync -f            # logs en vivo
-journalctl -u nginx-sync-cron --since today
 sudo systemctl restart nginx-sync
+sudo systemctl stop nginx-sync
+journalctl -u nginx-sync --since "1 hour ago"
+
+# forzar una sincronización sin reiniciar
+curl -X POST -H "Authorization: Bearer $SYNC_TOKEN" localhost:3000/sync
 ```
 
-### B.5 Actualizar
+Actualizar:
 
 ```bash
 cd /opt/nginx-sync
-sudo -u nginx-sync git pull
+sudo git pull
 sudo -u nginx-sync bun install
 sudo systemctl restart nginx-sync
 ```
 
----
+## Diagnóstico
 
-## Verificar el despliegue
+| Síntoma en `systemctl status` | Causa | Arreglo |
+|---|---|---|
+| `status=203/EXEC` | El usuario del servicio no puede ejecutar el binario de `ExecStart`. Típico: bun bajo `/root/.bun/`, con `/root` en `700`. | Confirmarlo con `sudo -u nginx-sync /usr/local/bin/bun --version`. Reinstalar bun con `BUN_INSTALL=/usr/local`, o correr `install.sh`, que lo copia solo. |
+| `status=200/CHDIR` | `WorkingDirectory` no existe o el usuario no puede entrar. | `sudo chown -R nginx-sync /opt/nginx-sync` |
+| `status=203/EXEC` con la ruta correcta | El binario perdió el bit de ejecución. | `sudo chmod 755 /usr/local/bin/bun` |
+| Arranca y muere: `[config] Falta la variable de entorno ENDPOINT_URL` | Falta `.env`, o el usuario no puede leerlo. | `sudo chown nginx-sync /opt/nginx-sync/.env` |
+| En el journal: `sudo: a password is required` | Falta la regla de sudoers, o las rutas no coinciden exactamente. | `sudo ./install.sh --with-reload`, y comparar con `which nginx`. |
+| `Permission denied` al escribir la config | El usuario no puede escribir en `sites-enabled/`. | `sudo chown -R nginx-sync /opt/nginx-sync/sites-enabled` |
+
+Ver el detalle completo del fallo:
 
 ```bash
-curl -s localhost:3000/health | jq                                  # sync.state debe ser "ok"
-curl -s -X POST -H "Authorization: Bearer $SYNC_TOKEN" localhost:3000/sync | jq
-ls -l /etc/nginx/sites-enabled/                                     # symlink al proyecto
-sudo nginx -t
+systemctl status nginx-sync --no-pager --full
+journalctl -u nginx-sync -n 50 --no-pager
 ```
 
-Si `sync.state` queda en `"failing"`, el campo `error` dice por qué y
-`nextRetryInMs` cuándo vuelve a intentar.
 
 ## Licencia
 
