@@ -1,79 +1,38 @@
-import { mkdir, writeFile, rename, unlink } from "node:fs/promises";
 import { config } from "./config.ts";
+import { buildApp, cliRetryPolicy } from "./composition.ts";
+import { ConsoleLogger } from "./infra/console-logger.ts";
+import { withRetry } from "./app/retry.ts";
 
-export interface SyncResult {
-  path: string;
-  bytes: number;
-  durationMs: number;
-  fetchedAt: string;
-}
+/**
+ * Entrypoint CLI one-shot: `bun run sync`.
+ * Reintenta ante fallos de red o del endpoint y sale 0/1 para cron, PM2 o systemd.
+ *
+ * Sin top-level await a propósito: PM2 carga el script con `require()`, que no
+ * soporta módulos async.
+ */
+async function main(): Promise<number> {
+  const logger = new ConsoleLogger("sync");
+  const { service } = buildApp(config, logger);
 
-export class SyncError extends Error {}
-
-async function download(): Promise<string> {
-  const headers: Record<string, string> = { Accept: "text/plain, */*" };
-  if (config.endpointAuth) headers.Authorization = config.endpointAuth;
-
-  let response: Response;
   try {
-    response = await fetch(config.endpointUrl, {
-      headers,
-      redirect: "follow",
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
+    const result = await withRetry(() => service.run(), {
+      policy: cliRetryPolicy(config),
+      logger,
     });
+
+    logger.info(
+      `${result.bytes} bytes → ${result.path} ` +
+        `(changed=${result.changed}, reloaded=${result.reloaded}, ${result.durationMs}ms)`,
+    );
+    // Un reload fallido se reporta como fallo para que el supervisor lo registre.
+    return result.reloadError ? 1 : 0;
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new SyncError(`No se pudo alcanzar el endpoint: ${reason}`);
+    logger.error(error instanceof Error ? error.message : String(error));
+    return 1;
   }
-
-  const body = await response.text();
-
-  if (!response.ok) {
-    const preview = body.slice(0, 200).replace(/\s+/g, " ").trim();
-    throw new SyncError(`El endpoint respondió ${response.status} ${response.statusText}: ${preview}`);
-  }
-
-  // Una respuesta vacía dejaría a nginx sin config; mejor conservar la anterior.
-  if (body.trim().length === 0) {
-    throw new SyncError("El endpoint respondió vacío; se conserva el archivo anterior.");
-  }
-
-  return body;
 }
 
-export async function sync(): Promise<SyncResult> {
-  const startedAt = performance.now();
-  const content = await download();
-
-  await mkdir(config.outputDir, { recursive: true });
-
-  // Escritura atómica: nginx nunca debe leer un archivo a medio escribir.
-  const tmpPath = `${config.outputPath}.tmp`;
-  try {
-    await writeFile(tmpPath, content, "utf8");
-    await rename(tmpPath, config.outputPath);
-  } catch (error) {
-    await unlink(tmpPath).catch(() => {});
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new SyncError(`No se pudo escribir ${config.outputPath}: ${reason}`);
-  }
-
-  return {
-    path: config.outputPath,
-    bytes: Buffer.byteLength(content, "utf8"),
-    durationMs: Math.round(performance.now() - startedAt),
-    fetchedAt: new Date().toISOString(),
-  };
-}
-
-// Modo CLI one-shot: `bun run sync`.
-if (import.meta.main) {
-  try {
-    const result = await sync();
-    console.log(`[sync] ${result.bytes} bytes → ${result.path} (${result.durationMs}ms)`);
-    process.exit(0);
-  } catch (error) {
-    console.error(`[sync] ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(1);
-  }
-}
+// exit() explícito: bajo PM2 el canal IPC mantiene vivo el event loop y el
+// proceso nunca terminaría solo. Es seguro porque ConsoleLogger escribe con
+// writeSync, así que no queda salida sin volcar.
+void main().then((code) => process.exit(code));

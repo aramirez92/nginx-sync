@@ -16,6 +16,9 @@ sites-enabled/*
 # backups de link.sh
 *.bak.*
 
+# logs de pm2
+logs/
+
 # varios
 *.log
 .DS_Store

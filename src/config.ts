@@ -1,4 +1,5 @@
 import { resolve, join, isAbsolute } from "node:path";
+import { writeSync } from "node:fs";
 
 // Raíz del proyecto: src/ está un nivel adentro. Se resuelve contra el archivo,
 // no contra process.cwd(), para poder invocar el script desde cualquier lugar.
@@ -14,6 +15,14 @@ export interface Config {
   syncToken: string | undefined;
   requestTimeoutMs: number;
   syncOnBoot: boolean;
+  nginxReload: boolean;
+  nginxTestCmd: string;
+  nginxReloadCmd: string;
+  retryDelayMs: number;
+  /** 0 = reintentar indefinidamente (servidor). */
+  retryMaxAttempts: number;
+  /** Intentos del CLI one-shot antes de rendirse. */
+  cliRetryMaxAttempts: number;
 }
 
 class ConfigError extends Error {}
@@ -39,6 +48,16 @@ function num(name: string, fallback: number): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new ConfigError(`${name} debe ser un número positivo, recibí "${raw}".`);
+  }
+  return parsed;
+}
+
+function count(name: string, fallback: number): number {
+  const raw = optional(name);
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new ConfigError(`${name} debe ser un entero >= 0, recibí "${raw}".`);
   }
   return parsed;
 }
@@ -93,6 +112,12 @@ function build(): Config {
     syncToken: optional("SYNC_TOKEN"),
     requestTimeoutMs: num("REQUEST_TIMEOUT_MS", 15_000),
     syncOnBoot: bool("SYNC_ON_BOOT", true),
+    nginxReload: bool("NGINX_RELOAD", false),
+    nginxTestCmd: optional("NGINX_TEST_CMD") ?? "sudo nginx -t",
+    nginxReloadCmd: optional("NGINX_RELOAD_CMD") ?? "sudo systemctl reload nginx",
+    retryDelayMs: num("RETRY_DELAY_MS", 30_000),
+    retryMaxAttempts: count("RETRY_MAX_ATTEMPTS", 0),
+    cliRetryMaxAttempts: count("CLI_RETRY_MAX_ATTEMPTS", 3),
   };
 }
 
@@ -101,7 +126,9 @@ export function loadConfig(): Config {
     return build();
   } catch (error) {
     if (error instanceof ConfigError) {
-      console.error(`[config] ${error.message}`);
+      // writeSync: un console.error seguido de process.exit se trunca cuando la
+      // salida está capturada por un pipe (PM2, systemd).
+      writeSync(2, `[config] ${error.message}\n`);
       process.exit(1);
     }
     throw error;

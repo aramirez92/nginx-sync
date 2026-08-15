@@ -1,29 +1,35 @@
 import { config } from "./config.ts";
-import { createServer, runSync } from "./server.ts";
+import { buildApp } from "./composition.ts";
+import { createServer } from "./server.ts";
+import { ConsoleLogger } from "./infra/console-logger.ts";
+
+const logger = new ConsoleLogger("server");
+const { supervisor, reloader } = buildApp(config, new ConsoleLogger("sync"));
 
 if (config.syncOnBoot) {
-  try {
-    const result = await runSync();
-    console.log(`[boot] sync ok: ${result.bytes} bytes → ${result.path} (${result.durationMs}ms)`);
-  } catch (error) {
-    // Un endpoint caído no debe impedir que el servidor arranque:
-    // el archivo previo sigue sirviendo y /sync permite reintentar.
-    console.error(`[boot] sync falló: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  // No bloquea el arranque: si falla, el supervisor reintenta en background
+  // cada RETRY_DELAY_MS mientras la config anterior sigue sirviendo.
+  supervisor.start();
 }
 
-const server = createServer().listen(config.port, () => {
-  console.log(`[server] escuchando en http://localhost:${config.port}`);
-  console.log(`[server] endpoint: ${config.endpointUrl}`);
-  console.log(`[server] salida:   ${config.outputPath}`);
+const server = createServer({ supervisor, reloader, config }).listen(config.port, () => {
+  logger.info(`escuchando en http://localhost:${config.port}`);
+  logger.info(`endpoint: ${config.endpointUrl}`);
+  logger.info(`salida:   ${config.outputPath}`);
+  logger.info(`reload:   ${reloader.description}`);
+  logger.info(
+    `reintentos: cada ${Math.round(config.retryDelayMs / 1000)}s ` +
+      `(${config.retryMaxAttempts === 0 ? "sin límite" : `${config.retryMaxAttempts} intentos`})`,
+  );
   if (!config.syncToken) {
-    console.warn("[server] SYNC_TOKEN vacío → POST /sync responde 503.");
+    logger.warn("SYNC_TOKEN vacío → POST /sync responde 503.");
   }
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
-    console.log(`\n[server] ${signal} recibido, cerrando...`);
+    logger.info(`${signal} recibido, cerrando...`);
+    supervisor.stop();
     server.close(() => process.exit(0));
     // Si alguna conexión queda colgada, no esperar para siempre.
     setTimeout(() => process.exit(0), 5000).unref();
