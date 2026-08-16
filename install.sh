@@ -201,6 +201,20 @@ if [[ $HAS_SYSTEMD -eq 0 ]]; then
   fi
 fi
 
+# --- estado de dpkg --------------------------------------------------------
+
+# Un dpkg interrumpido (Ctrl-C en un apt, corte de luz, imagen mal cerrada)
+# hace fallar cualquier apt-get con "dpkg was interrupted". La reparación es
+# 'dpkg --configure -a': termina de configurar lo que quedó a medias. Se detecta
+# acá para que aparezca en el plan, no a mitad de la instalación.
+DPKG_BROKEN=0
+if [[ "$PKG_MGR" == "apt-get" ]] && have dpkg; then
+  if [[ -n "$(dpkg --audit 2>/dev/null)" ]] || [[ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]]; then
+    DPKG_BROKEN=1
+    log "dpkg quedó a medias: hay que correr 'dpkg --configure -a' antes de instalar nada."
+  fi
+fi
+
 # --- herramientas requeridas ----------------------------------------------
 
 # Paquete que provee cada comando, por familia de distro.
@@ -441,6 +455,7 @@ log "usuario:     $SERVICE_USER"
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
   if [[ -n "$PKG_MGR" ]]; then
     log "paquetes:    instala ${MISSING_PKGS[*]} con $PKG_MGR"
+    [[ $DPKG_BROKEN -eq 1 ]] && log "dpkg:        quedó a medias; se repara con 'dpkg --configure -a' primero"
   else
     log "paquetes:    faltan ${MISSING_PKGS[*]}; hay que instalarlos a mano (gestor desconocido)"
   fi
@@ -485,11 +500,34 @@ fi
 
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
   step "dependencias del sistema"
+
+  # Termina de configurar los paquetes que quedaron a medias. Es la reparación
+  # estándar; sin esto, cualquier apt-get falla con "dpkg was interrupted".
+  dpkg_repair() {
+    log "reparando dpkg: dpkg --configure -a"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+  }
+
+  apt_install() {
+    # Lock::Timeout: en un server recién arrancado, unattended-upgrades suele
+    # tener tomado el lock de apt. Esperar es mejor que fallar.
+    apt-get -o DPkg::Lock::Timeout=120 update -qq
+    apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends "${MISSING_PKGS[@]}"
+  }
+
   case "$PKG_MGR" in
     apt-get)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
-      apt-get install -y --no-install-recommends "${MISSING_PKGS[@]}"
+      [[ $DPKG_BROKEN -eq 1 ]] && dpkg_repair
+      # Segundo intento tras reparar: la detección previa no cubre todos los
+      # estados rotos de dpkg, y el mensaje de apt sí.
+      if ! apt_install; then
+        log "apt falló; reintento tras 'dpkg --configure -a'."
+        dpkg_repair || fail "'dpkg --configure -a' falló. Arreglá dpkg a mano y volvé a correr esto:
+    sudo dpkg --configure -a
+    sudo apt-get -f install"
+        apt_install || fail "apt-get sigue fallando después de reparar dpkg. Revisá la salida de arriba."
+      fi
       ;;
     dnf)    dnf install -y "${MISSING_PKGS[@]}" ;;
     yum)    yum install -y "${MISSING_PKGS[@]}" ;;

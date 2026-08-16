@@ -357,6 +357,7 @@ sudo systemctl restart nginx-sync
 | `Permission denied` al escribir la config | El usuario no puede escribir en `sites-enabled/`. | `sudo chown -R nginx-sync /opt/nginx-sync/sites-enabled` |
 | `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
 | `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
+| `E: dpkg was interrupted...` | Un `apt` anterior quedó a medias (Ctrl-C, corte, imagen mal cerrada). Es previo a nginx-sync. | `install.sh` lo detecta y corre `dpkg --configure -a` solo. Si aún así falla: `sudo dpkg --configure -a && sudo apt-get -f install`. |
 | `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:
