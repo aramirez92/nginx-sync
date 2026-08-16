@@ -16,8 +16,14 @@ Corre con [Bun](https://bun.sh) y TypeScript. Sin paso de build.
 
 ## Requisitos
 
-- [Bun](https://bun.sh) >= 1.2
-- nginx y systemd (en el servidor Linux; los necesita `install.sh`)
+- Para desarrollar: [Bun](https://bun.sh) >= 1.2
+- Para desplegar: un Linux con systemd. Nada más — un solo comando baja el
+  código desde GitHub e instala lo que falte (bun, nginx, curl, unzip, sudo,
+  git, y nvm + Node LTS como extra):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aramirez92/nginx-sync/main/bootstrap.sh | sudo bash
+```
 
 ## Instalación
 
@@ -194,7 +200,8 @@ nginx-sync/
 ├── sites-enabled/                # destino de la descarga (contenido no versionado)
 ├── deploy/
 │   └── nginx-sync.service        # plantilla de la unidad de systemd
-├── install.sh                    # instalación completa: symlink, sudoers, servicio (root)
+├── bootstrap.sh                  # one-liner: baja el tar.gz de GitHub y corre install.sh (root)
+├── install.sh                    # instalación completa: deps, bun, .env, symlink, servicio (root)
 ├── .env.example
 ├── tsconfig.json
 └── package.json
@@ -214,65 +221,87 @@ cambiar una línea ahí. Los tests inyectan fakes en memoria por eso mismo.
 | `bun run sync` | Sincronización única y salida. |
 | `bun test` | Tests unitarios. |
 | `bun run typecheck` | `tsc --noEmit`. |
-| `sudo ./install.sh` | Instala todo y arranca el servicio de systemd. |
+| `sudo ./install.sh` | Instala dependencias, runtime, config y servicio de systemd. |
+| `curl … bootstrap.sh \| sudo bash` | Lo mismo, bajando antes el código desde GitHub. |
 
 ---
 
 # Despliegue
 
-Un servicio de systemd, instalado por `install.sh`. Probado en Debian/Ubuntu.
+Un servicio de systemd. Probado en Debian/Ubuntu. El servidor sólo necesita
+systemd: el resto lo bajan e instalan los scripts.
 
-### 1. Instalar Bun a nivel sistema
+### 1. Un comando
 
 ```bash
-curl -fsSL https://bun.sh/install | sudo BUN_INSTALL=/usr/local bash
-/usr/local/bin/bun --version
+curl -fsSL https://raw.githubusercontent.com/aramirez92/nginx-sync/main/bootstrap.sh | sudo bash
 ```
 
-`BUN_INSTALL=/usr/local` deja el binario real en `/usr/local/bin/bun`, legible por
-cualquier usuario.
+`bootstrap.sh` baja el código desde GitHub (tar.gz), lo deja en `/opt/nginx-sync`
+y corre `install.sh`. Si no hay `.env`, el instalador lo arma preguntando (URL
+del endpoint, token —lo puede generar solo—, puerto, nombre del archivo) y lo
+guarda con permisos `600`.
 
-> No sirve `ln -s ~/.bun/bin/bun /usr/local/bin/bun`: si se corrió como root, el
-> symlink apunta dentro de `/root`, que es `700`. El usuario del servicio no puede
-> atravesarlo y systemd falla con `203/EXEC`. Un symlink no cambia los permisos del
-> directorio destino.
+Desatendido, sin preguntas — lo que va después de `--` se le pasa a `install.sh`:
 
-### 2. Clonar y configurar
+```bash
+curl -fsSL https://raw.githubusercontent.com/aramirez92/nginx-sync/main/bootstrap.sh \
+  | sudo bash -s -- --non-interactive --endpoint-url https://tu-servidor/nginx.conf
+```
+
+Variables del bootstrap:
+
+| Variable | Default | Qué controla |
+|---|---|---|
+| `NGINX_SYNC_DIR` | `/opt/nginx-sync` | Dónde queda el código. |
+| `NGINX_SYNC_REF` | `main` | Rama, tag o commit a bajar. |
+| `NGINX_SYNC_REPO` | `aramirez92/nginx-sync` | Repo de origen (un fork, por ejemplo). |
+
+Volver a correrlo actualiza el código: ni `.env` ni los `.conf` descargados están
+en el repo, así que la extracción no los pisa.
+
+### 2. O clonando, si preferís git
 
 ```bash
 sudo git clone https://github.com/aramirez92/nginx-sync.git /opt/nginx-sync
 cd /opt/nginx-sync
-sudo cp .env.example .env
-sudo $EDITOR .env          # ENDPOINT_URL y SYNC_TOKEN
-```
-
-Generar un token: `openssl rand -hex 32`.
-
-### 3. Instalar
-
-```bash
-sudo ./install.sh --dry-run    # ver qué haría, sin tocar nada
+sudo ./install.sh --dry-run    # ver el plan, sin tocar nada
 sudo ./install.sh              # instalar de verdad
 ```
 
-Un solo comando hace todo:
+Con el token fuera del historial: `ENDPOINT_URL=... SYNC_TOKEN=... sudo -E ./install.sh -y`.
+
+Un solo comando hace todo, en este orden:
 
 | Paso | Qué hace |
 |---|---|
-| Resuelve `bun` | Busca el binario real. Si cuelga de un home inaccesible, lo copia a `/usr/local/bin/bun` — el arreglo del `203/EXEC`. |
+| Preflight | Detecta gestor de paquetes y systemd, y junta **todo** lo que falta antes de tocar nada. Sin systemd, aborta ahí. |
+| Dependencias | Instala lo que falte (`curl`, `unzip`, `git`, `tar`, `sudo`, `nginx`, `useradd`) con `apt/dnf/yum/zypper/apk/pacman`, y re-verifica cada comando. |
+| Bun | Si no está, lo baja con `BUN_INSTALL=/usr/local` → binario real en `/usr/local/bin/bun`. Si ya está pero cuelga de un home inaccesible, lo copia ahí — el arreglo del `203/EXEC`. |
+| nvm + Node | nvm en `/usr/local/nvm` (versión fijada) + Node LTS, con symlinks en `/usr/local/bin` y `/etc/profile.d/nvm.sh`. Extra del server: si falla, avisa y sigue. |
 | Usuario | Crea `nginx-sync` (`--system`, sin home, sin shell) si no existe. |
-| Configuración | Copia `.env` del ejemplo si falta y corre `bun install` si falta `node_modules/`. Aborta si `ENDPOINT_URL` sigue sin completar. |
+| Configuración | Wizard o flags/entorno → escribe `.env` conservando los comentarios del ejemplo. Prueba que el endpoint responda (aviso, no error) y corre `bun install` si falta `node_modules/`. |
 | Permisos | `chown -R` del proyecto, `.env` a `600`. |
 | Verifica | `sudo -u nginx-sync bun --version` **antes** de instalar; si falla, aborta con el motivo. |
 | Sudoers | Los dos comandos exactos para recargar nginx, validados con `visudo -cf`. |
 | Symlink | `/etc/nginx/sites-enabled` → el proyecto, con backup con timestamp del anterior y rollback si `nginx -t` falla. |
-| Servicio | Genera la unidad desde `deploy/nginx-sync.service`, `daemon-reload`, `enable --now`, y muestra estado y journal. |
+| Servicio | Genera la unidad desde `deploy/nginx-sync.service`, `daemon-reload`, `enable --now`. |
+| Verificación | Espera a que la unidad quede activa, consulta `/health` y confirma que el archivo se descargó. Si no arranca, imprime `status` + journal y sale con `1`. |
 
-Opciones: `--dry-run`, `--no-reload` (sin sudoers), `--help`.
+| Flag | Para qué |
+|---|---|
+| `--dry-run` | Imprime el plan completo y sale. No escribe nada, no pregunta nada. |
+| `--non-interactive`, `-y` | Nunca pregunta. Falla listando la config obligatoria que falte. |
+| `--endpoint-url`, `--sync-token`, `--endpoint-auth`, `--port` | Valores del `.env` sin wizard. Equivalen a las variables de entorno del mismo nombre (con `sudo -E`). |
+| `--no-install-deps` | Valida las dependencias del sistema pero no instala nada. |
+| `--no-nvm` | Omite nvm + Node. |
+| `--no-reload` | Sin regla de sudoers ni reload de nginx. |
 
-> **Advertencia:** `install.sh` corre como root: reemplaza
-> `/etc/nginx/sites-enabled`, escribe en `/etc/systemd/system/` y
-> `/etc/sudoers.d/`, crea un usuario del sistema y hace `chown -R` del proyecto.
+> **Advertencia:** `install.sh` corre como root: instala paquetes del sistema,
+> baja bun y nvm desde internet (`bun.sh`, `raw.githubusercontent.com`),
+> reemplaza `/etc/nginx/sites-enabled`, escribe en `/etc/systemd/system/`,
+> `/etc/sudoers.d/` y `/etc/profile.d/`, crea un usuario del sistema y hace
+> `chown -R` del proyecto.
 > El symlink de nginx se hace con backup con timestamp
 > (`/etc/nginx/sites-enabled.bak.AAAAMMDDHHMMSS`) y se revierte solo si `nginx -t`
 > falla; la regla de sudoers lista los dos comandos exactos, nunca
@@ -281,7 +310,9 @@ Opciones: `--dry-run`, `--no-reload` (sin sudoers), `--help`.
 
 Es idempotente: se puede volver a correr después de un `git pull`.
 
-### 4. Verificar
+### 3. Verificar
+
+`install.sh` ya hace esta verificación al final. A mano:
 
 ```bash
 systemctl status nginx-sync                  # Active: active (running)
@@ -304,6 +335,10 @@ curl -X POST -H "Authorization: Bearer $SYNC_TOKEN" localhost:3000/sync
 Actualizar:
 
 ```bash
+# si instalaste con el one-liner (no toca .env ni sites-enabled/)
+curl -fsSL https://raw.githubusercontent.com/aramirez92/nginx-sync/main/bootstrap.sh | sudo bash
+
+# si clonaste
 cd /opt/nginx-sync
 sudo git pull
 sudo -u nginx-sync bun install
@@ -321,6 +356,8 @@ sudo systemctl restart nginx-sync
 | En el journal: `sudo: a password is required` | Falta la regla de sudoers, o las rutas no coinciden exactamente. | `sudo ./install.sh`, y comparar con `which nginx`. |
 | `Permission denied` al escribir la config | El usuario no puede escribir en `sites-enabled/`. | `sudo chown -R nginx-sync /opt/nginx-sync/sites-enabled` |
 | `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
+| `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
+| `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:
 
