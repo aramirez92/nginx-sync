@@ -275,8 +275,8 @@ Un solo comando hace todo, en este orden:
 
 | Paso | Qué hace |
 |---|---|
-| Se despega de la sesión | Se re-ejecuta con `systemd-run` en la unidad transitoria `nginx-sync-install`. Instalar paquetes puede reiniciar los servicios de la sesión y matar el SSH; desde su propia unidad, la instalación sigue igual. `--no-detach` lo evita. |
 | Preflight | Detecta gestor de paquetes y systemd, y junta **todo** lo que falta antes de tocar nada. Sin systemd, aborta ahí. |
+| Se despega de la sesión | Con el plan ya armado y las preguntas ya hechas, la parte que muta el sistema se lanza con `systemd-run` en la unidad transitoria `nginx-sync-install`, y acá sólo se sigue el journal. Instalar paquetes puede reiniciar los servicios de la sesión y matar el SSH; desde su propia unidad, la instalación sigue igual. `--no-detach` lo evita. |
 | Dependencias | Instala lo que falte (`curl`, `unzip`, `git`, `tar`, `sudo`, `nginx`, `useradd`) con `apt/dnf/yum/zypper/apk/pacman`, y re-verifica cada comando. |
 | Bun | Si no está, lo baja con `BUN_INSTALL=/usr/local` → binario real en `/usr/local/bin/bun`. Si ya está pero cuelga de un home inaccesible, lo copia ahí — el arreglo del `203/EXEC`. |
 | nvm + Node | nvm en `/usr/local/nvm` (versión fijada) + Node LTS, con symlinks en `/usr/local/bin` y `/etc/profile.d/nvm.sh`. Extra del server: si falla, avisa y sigue. |
@@ -362,6 +362,7 @@ sudo systemctl restart nginx-sync
 | `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
 | `E: dpkg was interrupted...` | Un `apt` anterior quedó a medias (Ctrl-C, corte, imagen mal cerrada). Es previo a nginx-sync. | `install.sh` lo detecta y corre `dpkg --configure -a` solo. Si aún así falla: `sudo dpkg --configure -a && sudo apt-get -f install`. |
 | Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | Al configurar esos paquetes systemd reinicia los servicios de la sesión, y parar el scope de la sesión mata todo lo que cuelga de ella. Ignorar `SIGHUP` no alcanza: llega `SIGTERM` a todo el cgroup. | La instalación corre en la unidad `nginx-sync-install`, fuera de la sesión, así que sigue sola. Al reconectar: `journalctl -u nginx-sync-install -f` o `sudo tail -f /var/log/nginx-sync-install.log`. Volver a correrla es seguro. |
+| `ya hay una instalación corriendo en la unidad nginx-sync-install` | Quedó una corrida anterior viva o a medio morir. | `sudo systemctl status nginx-sync-install`; si no está haciendo nada útil: `sudo systemctl stop nginx-sync-install && sudo systemctl reset-failed nginx-sync-install`. |
 | `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:

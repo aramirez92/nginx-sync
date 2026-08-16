@@ -118,43 +118,8 @@ fi
 [[ -f "$UNIT_TEMPLATE" ]] || fail "falta $UNIT_TEMPLATE. ¿Corriste el script desde la raíz del repo?"
 [[ -f "$ENV_EXAMPLE" ]]   || fail "falta $ENV_EXAMPLE. ¿Corriste el script desde la raíz del repo?"
 
-# Correr fuera de la sesión SSH ---------------------------------------------
-#
-# Al configurar paquetes (en Raspberry Pi OS, rpi-connect) systemd reinicia los
-# servicios de la sesión, y parar el scope de la sesión SSH se lleva puesto todo
-# lo que cuelga de ella — sudo incluido. Ignorar SIGHUP no alcanza: lo que llega
-# es SIGTERM a todo el cgroup.
-#
-# La salida es no colgar de la sesión: systemd-run mueve la instalación a una
-# unidad transitoria propia. Si el SSH se cae, la instalación sigue sola y queda
-# en el journal de esa unidad.
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 SYSTEMD_VER="$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' || true)"
-
-if [[ $DRY_RUN -eq 0 && $DETACH -eq 1 && -z "${NGINX_SYNC_DETACHED:-}" ]] \
-   && [[ -d /run/systemd/system ]] \
-   && command -v systemd-run >/dev/null 2>&1 \
-   && [[ "$SYSTEMD_VER" =~ ^[0-9]+$ ]] && (( SYSTEMD_VER >= 240 )); then
-
-  if systemctl is-active --quiet nginx-sync-install 2>/dev/null; then
-    fail "ya hay una instalación corriendo en la unidad nginx-sync-install.
-    Seguila con:  journalctl -u nginx-sync-install -f"
-  fi
-  systemctl reset-failed nginx-sync-install 2>/dev/null || true
-
-  DETACH_ARGS=(--unit=nginx-sync-install --collect --same-dir --service-type=exec
-               --setenv=NGINX_SYNC_DETACHED=1)
-  for var in ENDPOINT_URL SYNC_TOKEN ENDPOINT_AUTH PORT OUTPUT_FILENAME NGINX_SITES_ENABLED; do
-    [[ -n "${!var:-}" ]] && DETACH_ARGS+=("--setenv=$var=${!var}")
-  done
-  # El wizard necesita terminal: --pty se la da. Sin terminal, --pipe alcanza.
-  if [[ -t 1 ]]; then DETACH_ARGS+=(--pty); else DETACH_ARGS+=(--pipe); fi
-  DETACH_ARGS+=(--wait)
-
-  printf '[install] corriendo en la unidad transitoria nginx-sync-install, fuera de la sesión SSH.\n' || true
-  printf '[install] si se corta la conexión, la instalación sigue:  journalctl -u nginx-sync-install -f\n' || true
-  exec systemd-run "${DETACH_ARGS[@]}" "$SELF" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
-fi
 
 # Sobrevivir a que se caiga la sesión --------------------------------------
 #
@@ -166,8 +131,19 @@ fi
 trap '' HUP
 trap '' PIPE
 
+# ¿La parte que muta el sistema va a correr en su propia unidad de systemd?
+# Se decide acá porque cambia quién escribe el log: si delegamos, lo escribe el
+# hijo, y teerlo también desde acá duplicaría cada línea.
+WILL_DETACH=0
+if [[ $DRY_RUN -eq 0 && $DETACH -eq 1 && -z "${NGINX_SYNC_DETACHED:-}" ]] \
+   && [[ -d /run/systemd/system ]] \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && [[ "$SYSTEMD_VER" =~ ^[0-9]+$ ]] && (( SYSTEMD_VER >= 240 )); then
+  WILL_DETACH=1
+fi
+
 LOG_FILE="/var/log/nginx-sync-install.log"
-if [[ $DRY_RUN -eq 0 && $EUID -eq 0 ]]; then
+if [[ $DRY_RUN -eq 0 && $EUID -eq 0 && $WILL_DETACH -eq 0 ]]; then
   # --output-error=warn: si la terminal muere, tee sigue escribiendo el archivo
   # en vez de abortar y llevarse el script puesto. Si la versión de tee no lo
   # soporta, se usa el modo normal.
@@ -582,6 +558,87 @@ if [[ $DRY_RUN -eq 1 ]]; then
   printf '\n[install] dry-run: no se escribió nada.\n'
   exit 0
 fi
+
+# ===========================================================================
+# Despegue de la sesión SSH
+# ===========================================================================
+#
+# Todo lo de arriba es lectura y preguntas: barato y sin riesgo de que corten.
+# Lo de abajo instala paquetes, y ahí está el problema: al configurar rpi-connect
+# (Raspberry Pi OS) systemd reinicia los servicios de la sesión, y parar el scope
+# de la sesión SSH mata todo lo que cuelga de ella, sudo incluido. Lo que llega
+# es SIGTERM a todo el cgroup, así que ignorar SIGHUP no alcanza.
+#
+# Por eso la parte que muta el sistema se corre en una unidad transitoria: sus
+# descriptores son el journal, no nuestra terminal, así que no depende de la
+# sesión ni para vivir ni para escribir. Acá sólo seguimos el journal; si se
+# corta el SSH, se pierde el streaming, no la instalación.
+#
+# Las respuestas del wizard viajan por --setenv, y el hijo corre con
+# --non-interactive: no necesita terminal, y por eso tampoco hace falta --pty
+# (que con 'curl | sudo bash' se cuelga: stdin es el pipe de curl, no un tty).
+
+detach_and_follow() {
+  local state result
+
+  if systemctl is-active --quiet nginx-sync-install 2>/dev/null; then
+    fail "ya hay una instalación corriendo en la unidad nginx-sync-install.
+    Seguila con:  journalctl -u nginx-sync-install -f"
+  fi
+  systemctl reset-failed nginx-sync-install 2>/dev/null || true
+
+  local args=(--unit=nginx-sync-install --same-dir --service-type=exec
+              --setenv=NGINX_SYNC_DETACHED=1
+              --setenv=NEEDRESTART_SUSPEND=1
+              --setenv=DEBIAN_FRONTEND=noninteractive
+              "--setenv=ENDPOINT_URL=$CFG_ENDPOINT_URL"
+              "--setenv=SYNC_TOKEN=$CFG_SYNC_TOKEN"
+              "--setenv=ENDPOINT_AUTH=$CFG_ENDPOINT_AUTH"
+              "--setenv=PORT=$CFG_PORT"
+              "--setenv=OUTPUT_FILENAME=$CFG_OUTPUT_FILENAME")
+  [[ -n "${NGINX_SITES_ENABLED:-}" ]] && args+=("--setenv=NGINX_SITES_ENABLED=$NGINX_SITES_ENABLED")
+
+  # El hijo ya tiene todas las respuestas: repite el preflight y ejecuta.
+  local child=(--non-interactive --no-detach)
+  [[ $WITH_RELOAD  -eq 0 ]] && child+=(--no-reload)
+  [[ $WITH_NVM     -eq 0 ]] && child+=(--no-nvm)
+  [[ $INSTALL_DEPS -eq 0 ]] && child+=(--no-install-deps)
+
+  step "instalación (unidad nginx-sync-install)"
+  log "corre fuera de la sesión SSH: si se corta la conexión, sigue sola."
+  log "seguirla o retomarla:  journalctl -u nginx-sync-install -f"
+  systemd-run "${args[@]}" "$SELF" "${child[@]}" >/dev/null \
+    || fail "no pude arrancar la unidad nginx-sync-install."
+
+  # Streaming best-effort: que se caiga no afecta a la instalación.
+  journalctl -u nginx-sync-install -f -n 0 --no-pager 2>/dev/null &
+  local follow_pid=$!
+
+  while :; do
+    state="$(systemctl show -p ActiveState --value nginx-sync-install 2>/dev/null || echo inactive)"
+    case "$state" in
+      activating|active|reloading|deactivating) sleep 2 ;;
+      *) break ;;
+    esac
+  done
+
+  sleep 1
+  kill "$follow_pid" 2>/dev/null || true
+  wait "$follow_pid" 2>/dev/null || true
+
+  result="$(systemctl show -p ExecMainStatus --value nginx-sync-install 2>/dev/null || echo '?')"
+  systemctl reset-failed nginx-sync-install 2>/dev/null || true
+
+  if [[ "$result" == "0" ]]; then
+    log "instalación terminada."
+    exit 0
+  fi
+  fail "la instalación falló (código $result). El detalle:
+    journalctl -u nginx-sync-install -n 60 --no-pager
+    $LOG_FILE"
+}
+
+[[ $WILL_DETACH -eq 1 ]] && detach_and_follow
 
 # ===========================================================================
 # Ejecución
