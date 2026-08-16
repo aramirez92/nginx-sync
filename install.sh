@@ -807,15 +807,26 @@ else
 fi
 
 # Aviso, no error: la red del server puede no estar lista todavía.
-ENDPOINT_CODE="$(curl -fsS -o /dev/null -w '%{http_code}' -I --max-time 10 "$CFG_ENDPOINT_URL" 2>/dev/null || true)"
-if [[ -z "$ENDPOINT_CODE" || "$ENDPOINT_CODE" == "000" || "$ENDPOINT_CODE" == "405" ]]; then
-  # Hay endpoints que no aceptan HEAD: reintentar pidiendo sólo el primer byte.
-  ENDPOINT_CODE="$(curl -fsS -o /dev/null -w '%{http_code}' -r 0-0 --max-time 10 "$CFG_ENDPOINT_URL" 2>/dev/null || true)"
-fi
+#
+# El HEAD es sólo un atajo. Un montón de endpoints (webhooks de n8n, Zapier y
+# compañía) sólo registran GET y contestan 404/405 a un HEAD que igual serviría,
+# así que cualquier respuesta que no sea 2xx se reintenta con un GET real —el
+# mismo verbo que va a usar el servicio— pidiendo un solo byte.
+AUTH_ARGS=()
+[[ -n "$CFG_ENDPOINT_AUTH" ]] && AUTH_ARGS=(-H "Authorization: $CFG_ENDPOINT_AUTH")
+
+ENDPOINT_HEAD="$(curl -fsS -o /dev/null -w '%{http_code}' -I --max-time 10 \
+  ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CFG_ENDPOINT_URL" 2>/dev/null || true)"
+ENDPOINT_CODE="$ENDPOINT_HEAD"
+case "$ENDPOINT_HEAD" in
+  2*) : ;;
+  *)  ENDPOINT_CODE="$(curl -fsS -o /dev/null -w '%{http_code}' -r 0-0 --max-time 10 \
+        ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} "$CFG_ENDPOINT_URL" 2>/dev/null || true)" ;;
+esac
 case "$ENDPOINT_CODE" in
-  2*) log "endpoint alcanzable (HTTP $ENDPOINT_CODE)." ;;
-  "") warn "no pude alcanzar $CFG_ENDPOINT_URL. El servicio va a reintentar solo." ;;
-  *)  warn "el endpoint respondió HTTP $ENDPOINT_CODE. Revisá ENDPOINT_URL/ENDPOINT_AUTH." ;;
+  2*)      log "endpoint alcanzable (HTTP $ENDPOINT_CODE)." ;;
+  ""|000)  warn "no pude alcanzar $CFG_ENDPOINT_URL (DNS, red o TLS). El servicio va a reintentar solo." ;;
+  *)       warn "el endpoint respondió HTTP $ENDPOINT_CODE al GET. Revisá ENDPOINT_URL/ENDPOINT_AUTH." ;;
 esac
 
 if [[ -d "$SCRIPT_DIR/node_modules" ]]; then
@@ -946,10 +957,18 @@ else
   warn "no respondió http://127.0.0.1:$CFG_PORT/health (puede tardar unos segundos más)."
 fi
 
+# La primera descarga tarda un momento: darle tiempo antes de dar el aviso.
+for _ in $(seq 1 10); do
+  [[ -f "$SITES_TARGET/$CFG_OUTPUT_FILENAME" ]] && break
+  sleep 1
+done
+
 if [[ -f "$SITES_TARGET/$CFG_OUTPUT_FILENAME" ]]; then
-  log "config descargada: $SITES_TARGET/$CFG_OUTPUT_FILENAME"
+  log "config descargada: $SITES_TARGET/$CFG_OUTPUT_FILENAME ($(wc -c < "$SITES_TARGET/$CFG_OUTPUT_FILENAME") bytes)"
 else
-  warn "todavía no existe $SITES_TARGET/$CFG_OUTPUT_FILENAME; mirá el journal si no aparece."
+  warn "no se descargó $SITES_TARGET/$CFG_OUTPUT_FILENAME. Qué mirar:
+    journalctl -u nginx-sync -n 30 --no-pager
+    curl -s localhost:$CFG_PORT/health"
 fi
 
 printf '\n[install] listo. Logs en vivo:  journalctl -u nginx-sync -f\n' || true
