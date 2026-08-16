@@ -275,6 +275,7 @@ Un solo comando hace todo, en este orden:
 
 | Paso | Qué hace |
 |---|---|
+| Se despega de la sesión | Se re-ejecuta con `systemd-run` en la unidad transitoria `nginx-sync-install`. Instalar paquetes puede reiniciar los servicios de la sesión y matar el SSH; desde su propia unidad, la instalación sigue igual. `--no-detach` lo evita. |
 | Preflight | Detecta gestor de paquetes y systemd, y junta **todo** lo que falta antes de tocar nada. Sin systemd, aborta ahí. |
 | Dependencias | Instala lo que falte (`curl`, `unzip`, `git`, `tar`, `sudo`, `nginx`, `useradd`) con `apt/dnf/yum/zypper/apk/pacman`, y re-verifica cada comando. |
 | Bun | Si no está, lo baja con `BUN_INSTALL=/usr/local` → binario real en `/usr/local/bin/bun`. Si ya está pero cuelga de un home inaccesible, lo copia ahí — el arreglo del `203/EXEC`. |
@@ -293,6 +294,7 @@ Un solo comando hace todo, en este orden:
 | `--dry-run` | Imprime el plan completo y sale. No escribe nada, no pregunta nada. |
 | `--non-interactive`, `-y` | Nunca pregunta. Falla listando la config obligatoria que falte. |
 | `--endpoint-url`, `--sync-token`, `--endpoint-auth`, `--port` | Valores del `.env` sin wizard. Equivalen a las variables de entorno del mismo nombre (con `sudo -E`). |
+| `--no-detach` | No re-ejecutarse en una unidad transitoria de systemd (ver abajo). |
 | `--no-install-deps` | Valida las dependencias del sistema pero no instala nada. |
 | `--no-nvm` | Omite nvm + Node. |
 | `--no-reload` | Sin regla de sudoers ni reload de nginx. |
@@ -359,7 +361,7 @@ sudo systemctl restart nginx-sync
 | `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
 | `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
 | `E: dpkg was interrupted...` | Un `apt` anterior quedó a medias (Ctrl-C, corte, imagen mal cerrada). Es previo a nginx-sync. | `install.sh` lo detecta y corre `dpkg --configure -a` solo. Si aún así falla: `sudo dpkg --configure -a && sudo apt-get -f install`. |
-| Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | `apt` reinicia servicios de sesión: `needrestart` y los servicios de usuario del paquete. | El instalador ignora `SIGHUP` y sigue solo. Reconectar y mirar `sudo tail -f /var/log/nginx-sync-install.log`; si quedó a medias, volver a correrlo (es idempotente). |
+| Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | Al configurar esos paquetes systemd reinicia los servicios de la sesión, y parar el scope de la sesión mata todo lo que cuelga de ella. Ignorar `SIGHUP` no alcanza: llega `SIGTERM` a todo el cgroup. | La instalación corre en la unidad `nginx-sync-install`, fuera de la sesión, así que sigue sola. Al reconectar: `journalctl -u nginx-sync-install -f` o `sudo tail -f /var/log/nginx-sync-install.log`. Volver a correrla es seguro. |
 | `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:

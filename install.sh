@@ -74,6 +74,7 @@ Flags:
   --no-install-deps      valida las dependencias del sistema pero no las instala
   --no-nvm               omite la instalación de nvm + Node LTS
   --non-interactive, -y  nunca pregunta; falla si falta config obligatoria
+  --no-detach            no re-ejecutarse en una unidad transitoria de systemd
   --endpoint-url URL     valores para el .env (equivalen a ENDPOINT_URL, etc.)
   --sync-token TOKEN
   --endpoint-auth VALOR
@@ -85,6 +86,9 @@ EOF
 
 need_value() { [[ $# -ge 2 && -n "${2:-}" ]] || fail "$1 necesita un valor."; }
 
+ORIG_ARGS=("$@")   # para re-ejecutarse fuera de la sesión SSH (ver más abajo)
+DETACH=1
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)             DRY_RUN=1; shift ;;
@@ -92,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --no-install-deps)     INSTALL_DEPS=0; shift ;;
     --no-nvm)              WITH_NVM=0; shift ;;
     --non-interactive|-y)  INTERACTIVE=0; shift ;;
+    --no-detach)           DETACH=0; shift ;;
     --endpoint-url)        need_value "$1" "${2:-}"; CFG_ENDPOINT_URL="$2"; shift 2 ;;
     --sync-token)          need_value "$1" "${2:-}"; CFG_SYNC_TOKEN="$2"; shift 2 ;;
     --endpoint-auth)       need_value "$1" "${2:-}"; CFG_ENDPOINT_AUTH="$2"; shift 2 ;;
@@ -112,6 +117,44 @@ fi
 
 [[ -f "$UNIT_TEMPLATE" ]] || fail "falta $UNIT_TEMPLATE. ¿Corriste el script desde la raíz del repo?"
 [[ -f "$ENV_EXAMPLE" ]]   || fail "falta $ENV_EXAMPLE. ¿Corriste el script desde la raíz del repo?"
+
+# Correr fuera de la sesión SSH ---------------------------------------------
+#
+# Al configurar paquetes (en Raspberry Pi OS, rpi-connect) systemd reinicia los
+# servicios de la sesión, y parar el scope de la sesión SSH se lleva puesto todo
+# lo que cuelga de ella — sudo incluido. Ignorar SIGHUP no alcanza: lo que llega
+# es SIGTERM a todo el cgroup.
+#
+# La salida es no colgar de la sesión: systemd-run mueve la instalación a una
+# unidad transitoria propia. Si el SSH se cae, la instalación sigue sola y queda
+# en el journal de esa unidad.
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+SYSTEMD_VER="$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' || true)"
+
+if [[ $DRY_RUN -eq 0 && $DETACH -eq 1 && -z "${NGINX_SYNC_DETACHED:-}" ]] \
+   && [[ -d /run/systemd/system ]] \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && [[ "$SYSTEMD_VER" =~ ^[0-9]+$ ]] && (( SYSTEMD_VER >= 240 )); then
+
+  if systemctl is-active --quiet nginx-sync-install 2>/dev/null; then
+    fail "ya hay una instalación corriendo en la unidad nginx-sync-install.
+    Seguila con:  journalctl -u nginx-sync-install -f"
+  fi
+  systemctl reset-failed nginx-sync-install 2>/dev/null || true
+
+  DETACH_ARGS=(--unit=nginx-sync-install --collect --same-dir --service-type=exec
+               --setenv=NGINX_SYNC_DETACHED=1)
+  for var in ENDPOINT_URL SYNC_TOKEN ENDPOINT_AUTH PORT OUTPUT_FILENAME NGINX_SITES_ENABLED; do
+    [[ -n "${!var:-}" ]] && DETACH_ARGS+=("--setenv=$var=${!var}")
+  done
+  # El wizard necesita terminal: --pty se la da. Sin terminal, --pipe alcanza.
+  if [[ -t 1 ]]; then DETACH_ARGS+=(--pty); else DETACH_ARGS+=(--pipe); fi
+  DETACH_ARGS+=(--wait)
+
+  printf '[install] corriendo en la unidad transitoria nginx-sync-install, fuera de la sesión SSH.\n' || true
+  printf '[install] si se corta la conexión, la instalación sigue:  journalctl -u nginx-sync-install -f\n' || true
+  exec systemd-run "${DETACH_ARGS[@]}" "$SELF" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+fi
 
 # Sobrevivir a que se caiga la sesión --------------------------------------
 #
