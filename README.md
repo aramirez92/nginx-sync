@@ -312,7 +312,8 @@ Es idempotente: se puede volver a correr después de un `git pull`.
 
 ### 3. Verificar
 
-`install.sh` ya hace esta verificación al final. A mano:
+`install.sh` ya hace esta verificación al final, y deja todo en
+`/var/log/nginx-sync-install.log` (útil si la sesión SSH se cortó). A mano:
 
 ```bash
 systemctl status nginx-sync                  # Active: active (running)
@@ -358,6 +359,7 @@ sudo systemctl restart nginx-sync
 | `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
 | `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
 | `E: dpkg was interrupted...` | Un `apt` anterior quedó a medias (Ctrl-C, corte, imagen mal cerrada). Es previo a nginx-sync. | `install.sh` lo detecta y corre `dpkg --configure -a` solo. Si aún así falla: `sudo dpkg --configure -a && sudo apt-get -f install`. |
+| Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | `apt` reinicia servicios de sesión: `needrestart` y los servicios de usuario del paquete. | El instalador ignora `SIGHUP` y sigue solo. Reconectar y mirar `sudo tail -f /var/log/nginx-sync-install.log`; si quedó a medias, volver a correrlo (es idempotente). |
 | `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:

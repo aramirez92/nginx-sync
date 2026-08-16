@@ -38,6 +38,13 @@ if [[ $EUID -ne 0 ]]; then
     curl -fsSL https://raw.githubusercontent.com/$REPO/$REF/bootstrap.sh | sudo bash"
 fi
 
+# En Raspberry Pi OS un apt puede reiniciar servicios de sesión y tirar el SSH.
+# Ignorar SIGHUP deja que la instalación termine igual (install.sh hace lo mismo
+# y además loguea todo en /var/log/nginx-sync-install.log).
+trap '' HUP
+export NEEDRESTART_SUSPEND=1
+export NEEDRESTART_MODE=l
+
 # --- curl y tar ------------------------------------------------------------
 
 # El caso normal es que curl ya esté (este script llegó por curl), pero también

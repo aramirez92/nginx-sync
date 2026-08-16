@@ -53,10 +53,12 @@ CFG_ENDPOINT_AUTH="${ENDPOINT_AUTH:-}"
 CFG_PORT="${PORT:-}"
 CFG_OUTPUT_FILENAME="${OUTPUT_FILENAME:-}"
 
-log()  { printf '[install] %s\n' "$*"; }
-warn() { printf '[install] AVISO: %s\n' "$*" >&2; }
-fail() { printf '[install] ERROR: %s\n' "$*" >&2; exit 1; }
-step() { printf '\n[install] == %s ==\n' "$*"; }
+# El '|| true' es para cuando se cae la sesión SSH: escribir en una terminal
+# muerta falla, y sin esto errexit mataría una instalación que puede seguir.
+log()  { printf '[install] %s\n' "$*" || true; }
+warn() { printf '[install] AVISO: %s\n' "$*" >&2 || true; }
+fail() { printf '[install] ERROR: %s\n' "$*" >&2 || true; exit 1; }
+step() { printf '\n[install] == %s ==\n' "$*" || true; }
 
 usage() {
   cat <<'EOF'
@@ -111,6 +113,34 @@ fi
 [[ -f "$UNIT_TEMPLATE" ]] || fail "falta $UNIT_TEMPLATE. ¿Corriste el script desde la raíz del repo?"
 [[ -f "$ENV_EXAMPLE" ]]   || fail "falta $ENV_EXAMPLE. ¿Corriste el script desde la raíz del repo?"
 
+# Sobrevivir a que se caiga la sesión --------------------------------------
+#
+# En Raspberry Pi OS un apt puede reiniciar servicios de sesión (needrestart,
+# los servicios de usuario de rpi-connect) y tirar la conexión SSH. Si eso pasa
+# a mitad de la instalación, el sistema queda a medias. Ignorar SIGHUP deja que
+# el script termine igual aunque la terminal desaparezca, y todo queda además
+# en el log, para leerlo al reconectar.
+trap '' HUP
+trap '' PIPE
+
+LOG_FILE="/var/log/nginx-sync-install.log"
+if [[ $DRY_RUN -eq 0 && $EUID -eq 0 ]]; then
+  # --output-error=warn: si la terminal muere, tee sigue escribiendo el archivo
+  # en vez de abortar y llevarse el script puesto. Si la versión de tee no lo
+  # soporta, se usa el modo normal.
+  if tee --output-error=warn </dev/null >/dev/null 2>&1; then
+    exec > >(tee -a --output-error=warn "$LOG_FILE") 2>&1
+  else
+    exec > >(tee -a "$LOG_FILE") 2>&1
+  fi
+  log "log completo en $LOG_FILE"
+fi
+
+# Y evitar el reinicio en primer lugar: needrestart reinicia servicios solo
+# durante apt, incluidos los de la sesión.
+export NEEDRESTART_SUSPEND=1
+export NEEDRESTART_MODE=l
+
 # ===========================================================================
 # Utilidades
 # ===========================================================================
@@ -156,12 +186,24 @@ gen_token() {
 ask() {
   local prompt="$1" default="${2:-}" answer=""
   if [[ -n "$default" ]]; then
-    printf '  %s [%s]: ' "$prompt" "$default" > /dev/tty
+    printf '  %s [%s]: ' "$prompt" "$default" > /dev/tty || true
   else
-    printf '  %s: ' "$prompt" > /dev/tty
+    printf '  %s: ' "$prompt" > /dev/tty || true
   fi
   IFS= read -r answer < /dev/tty || answer=""
   printf '%s' "${answer:-$default}"
+}
+
+# Los bucles del wizard re-preguntan hasta que el valor sea válido. Si la
+# terminal desaparece, 'ask' devuelve vacío para siempre: este tope evita que
+# el instalador quede girando en el vacío.
+WIZARD_MAX_TRIES=5
+wizard_guard() {
+  local tries="$1" campo="$2"
+  [[ $tries -le $WIZARD_MAX_TRIES ]] && return 0
+  fail "demasiados intentos inválidos para $campo (¿se cortó la terminal?).
+    Volvé a correr el instalador, o pasá los valores sin preguntas:
+      sudo $0 --non-interactive --endpoint-url https://tu-servidor/nginx.conf"
 }
 
 ask_yes_no() {
@@ -399,10 +441,12 @@ if [[ $RUN_WIZARD -eq 1 && $DRY_RUN -eq 0 ]]; then
   step "configuración interactiva"
   printf '  Falta la configuración. Respondé y se guarda en %s\n  (Enter usa el valor entre corchetes.)\n\n' "$ENV_FILE"
 
+  tries=0
   while :; do
+    tries=$((tries + 1)); wizard_guard "$tries" ENDPOINT_URL
     CFG_ENDPOINT_URL="$(ask 'URL del endpoint con la config de nginx' "$CFG_ENDPOINT_URL")"
     env_url_is_valid "$CFG_ENDPOINT_URL" && break
-    printf '  ↳ tiene que empezar con http:// o https:// y no ser el ejemplo.\n' > /dev/tty
+    printf '  ↳ tiene que empezar con http:// o https:// y no ser el ejemplo.\n' > /dev/tty || true
   done
 
   CFG_ENDPOINT_AUTH="$(ask 'Header Authorization para ese endpoint (opcional, ej. "Bearer abc")' "$CFG_ENDPOINT_AUTH")"
@@ -410,26 +454,30 @@ if [[ $RUN_WIZARD -eq 1 && $DRY_RUN -eq 0 ]]; then
   if [[ -z "$CFG_SYNC_TOKEN" ]]; then
     if ask_yes_no 'Generar un SYNC_TOKEN para POST /sync' 's'; then
       CFG_SYNC_TOKEN="$(gen_token)"
-      printf '  ↳ token generado: %s\n' "$CFG_SYNC_TOKEN" > /dev/tty
+      printf '  ↳ token generado: %s\n' "$CFG_SYNC_TOKEN" > /dev/tty || true
     else
       CFG_SYNC_TOKEN="$(ask 'SYNC_TOKEN (vacío deshabilita POST /sync)' '')"
     fi
   fi
 
+  tries=0
   while :; do
+    tries=$((tries + 1)); wizard_guard "$tries" PORT
     CFG_PORT="$(ask 'Puerto del servidor' "$CFG_PORT")"
     if [[ "$CFG_PORT" =~ ^[0-9]+$ ]] && (( CFG_PORT >= 1 && CFG_PORT <= 65535 )); then
       port_in_use "$CFG_PORT" || break
-      printf '  ↳ el puerto %s está ocupado; elegí otro.\n' "$CFG_PORT" > /dev/tty
+      printf '  ↳ el puerto %s está ocupado; elegí otro.\n' "$CFG_PORT" > /dev/tty || true
     else
-      printf '  ↳ tiene que ser un número entre 1 y 65535.\n' > /dev/tty
+      printf '  ↳ tiene que ser un número entre 1 y 65535.\n' > /dev/tty || true
     fi
   done
 
+  tries=0
   while :; do
+    tries=$((tries + 1)); wizard_guard "$tries" OUTPUT_FILENAME
     CFG_OUTPUT_FILENAME="$(ask 'Nombre del archivo de salida en sites-enabled/' "$CFG_OUTPUT_FILENAME")"
     [[ -n "$CFG_OUTPUT_FILENAME" && "$CFG_OUTPUT_FILENAME" != */* && "$CFG_OUTPUT_FILENAME" != *..* ]] && break
-    printf '  ↳ sin barras ni ".."; es un nombre de archivo, no una ruta.\n' > /dev/tty
+    printf '  ↳ sin barras ni ".."; es un nombre de archivo, no una ruta.\n' > /dev/tty || true
   done
 
   if [[ $WITH_RELOAD -eq 1 ]] && ! ask_yes_no 'Recargar nginx cuando la config cambie' 's'; then
@@ -505,14 +553,22 @@ if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
   # estándar; sin esto, cualquier apt-get falla con "dpkg was interrupted".
   dpkg_repair() {
     log "reparando dpkg: dpkg --configure -a"
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+    # Configura los paquetes que quedaron a medias, sin abrir prompts de config.
+    # En Raspberry Pi OS esto puede tocar rpi-connect y reiniciar servicios de
+    # sesión: por eso el trap de SIGHUP de más arriba.
+    DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a
   }
 
   apt_install() {
     # Lock::Timeout: en un server recién arrancado, unattended-upgrades suele
     # tener tomado el lock de apt. Esperar es mejor que fallar.
+    # force-confold/confdef: sin esto, un paquete con config modificada abre un
+    # prompt y la instalación desatendida se cuelga esperando una respuesta.
     apt-get -o DPkg::Lock::Timeout=120 update -qq
-    apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends "${MISSING_PKGS[@]}"
+    apt-get -o DPkg::Lock::Timeout=120 \
+            -o Dpkg::Options::=--force-confold \
+            -o Dpkg::Options::=--force-confdef \
+            install -y --no-install-recommends "${MISSING_PKGS[@]}"
   }
 
   case "$PKG_MGR" in
@@ -796,4 +852,5 @@ else
   warn "todavía no existe $SITES_TARGET/$CFG_OUTPUT_FILENAME; mirá el journal si no aparece."
 fi
 
-printf '\n[install] listo. Logs en vivo:  journalctl -u nginx-sync -f\n'
+printf '\n[install] listo. Logs en vivo:  journalctl -u nginx-sync -f\n' || true
+printf '[install] log de esta instalación: %s\n' "$LOG_FILE" || true
