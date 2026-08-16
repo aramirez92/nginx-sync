@@ -260,6 +260,9 @@ Variables del bootstrap:
 Volver a correrlo actualiza el código: ni `.env` ni los `.conf` descargados están
 en el repo, así que la extracción no los pisa.
 
+Si el SSH se corta a mitad de camino, la instalación sigue sola: cómo volver a
+engancharse está en [Si se corta la conexión](#si-se-corta-la-conexión).
+
 ### 2. O clonando, si preferís git
 
 ```bash
@@ -324,6 +327,58 @@ ls -l /etc/nginx/sites-enabled/              # el symlink al proyecto
 journalctl -u nginx-sync -f                  # logs en vivo
 ```
 
+## Si se corta la conexión
+
+La instalación tiene dos etapas, y sólo la primera depende del SSH:
+
+| Etapa | Dónde corre | Si se cae la conexión |
+|---|---|---|
+| Preguntas y plan | En tu sesión SSH | Se pierde, pero todavía no se escribió nada |
+| Instalación | En la unidad `nginx-sync-install`, fuera de la sesión | Sigue sola hasta el final |
+
+Instalar paquetes puede reiniciar los servicios de la sesión y tirarte el SSH — pasa
+en Raspberry Pi OS al configurar `rpi-connect`. Por eso la segunda etapa vive en su
+propia unidad de systemd: lo que se corta es el streaming, no la instalación.
+
+**Si se cortó mientras respondías las preguntas**, no se tocó el sistema. Volvé a
+correr el mismo comando de instalación.
+
+**Si se cortó después**, reconectá y preguntá en qué quedó:
+
+```bash
+systemctl is-active nginx-sync-install
+```
+
+| Respuesta | Significa | Qué hacer |
+|---|---|---|
+| `active` | Sigue instalando | `journalctl -u nginx-sync-install -f` y seguirla desde donde va |
+| `inactive` | Terminó | Verificar el resultado, más abajo |
+| `failed` | Terminó mal | `journalctl -u nginx-sync-install -n 50 --no-pager` |
+
+Para ver la corrida entera, no sólo el final:
+
+```bash
+journalctl -u nginx-sync-install -b --no-pager   # todo, desde el arranque
+sudo less /var/log/nginx-sync-install.log        # lo mismo, en archivo
+```
+
+Terminara como terminara, lo que importa es el estado final — los comandos de
+[Verificar](#3-verificar): `systemctl status nginx-sync`, `/health` y el contenido de
+`sites-enabled/`.
+
+**Para reintentar**, volvé a correr el comando de instalación: es idempotente y no
+pisa `.env` ni los `.conf` ya descargados. Si quedó una unidad trabada de la corrida
+anterior (`ya hay una instalación corriendo`), limpiala primero:
+
+```bash
+sudo systemctl stop nginx-sync-install
+sudo systemctl reset-failed nginx-sync-install
+```
+
+**Para no perder el streaming**, corré la instalación dentro de `tmux` o `screen`. Y
+si preferís lo contrario —todo en la sesión, sin unidad aparte— está `--no-detach`,
+con la contra de que ahí sí un corte te deja la instalación por la mitad.
+
 ## Operación
 
 ```bash
@@ -361,8 +416,8 @@ sudo systemctl restart nginx-sync
 | `nginx -t` falla al instalar | La config descargada es inválida. `install.sh` ya restauró el `sites-enabled` anterior. | Revisar el archivo en `sites-enabled/` y volver a correr `install.sh`. |
 | `install.sh`: `no reconocí el gestor de paquetes` | Distro fuera de la lista (`apt/dnf/yum/zypper/apk/pacman`). | Instalar a mano lo que liste el preflight y volver a correr. |
 | `E: dpkg was interrupted...` | Un `apt` anterior quedó a medias (Ctrl-C, corte, imagen mal cerrada). Es previo a nginx-sync. | `install.sh` lo detecta y corre `dpkg --configure -a` solo. Si aún así falla: `sudo dpkg --configure -a && sudo apt-get -f install`. |
-| Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | Al configurar esos paquetes systemd reinicia los servicios de la sesión, y parar el scope de la sesión mata todo lo que cuelga de ella. Ignorar `SIGHUP` no alcanza: llega `SIGTERM` a todo el cgroup. | La instalación corre en la unidad `nginx-sync-install`, fuera de la sesión, así que sigue sola. Al reconectar: `journalctl -u nginx-sync-install -f` o `sudo tail -f /var/log/nginx-sync-install.log`. Volver a correrla es seguro. |
-| `ya hay una instalación corriendo en la unidad nginx-sync-install` | Quedó una corrida anterior viva o a medio morir. | `sudo systemctl status nginx-sync-install`; si no está haciendo nada útil: `sudo systemctl stop nginx-sync-install && sudo systemctl reset-failed nginx-sync-install`. |
+| Se cierra la sesión SSH a mitad de la instalación (típico en Raspberry Pi OS, configurando `rpi-connect`) | Al configurar esos paquetes systemd reinicia los servicios de la sesión, y parar el scope de la sesión mata todo lo que cuelga de ella. Ignorar `SIGHUP` no alcanza: llega `SIGTERM` a todo el cgroup. | La instalación sigue sola en su propia unidad: [Si se corta la conexión](#si-se-corta-la-conexión). |
+| `ya hay una instalación corriendo en la unidad nginx-sync-install` | Quedó una corrida anterior viva o a medio morir. | Ver en qué estado está y limpiarla: [Si se corta la conexión](#si-se-corta-la-conexión). |
 | `install.sh`: `nvm/Node no quedaron instalados` | Sin salida a `raw.githubusercontent.com`, o la instalación de nvm falló. | No es fatal: nginx-sync corre con bun. Repetir con `--no-nvm` para saltearlo. |
 
 Ensayar el symlink sin tocar `/etc/nginx`:
